@@ -6,6 +6,12 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+//  ****************************
+struct proc *queue[5][NPROC];
+int q_num[5] = {-1, -1, -1, -1, -1};
+int q_time_max[5] = {1, 2, 4, 8, 16};
+int q_time[5] = {0, 0, 0, 0, 0};
+//  ****************************
 
 struct {
   struct spinlock lock;
@@ -19,6 +25,68 @@ extern void forkret(void);
 extern void trapret(void);
 
 static void wakeup1(void *chan);
+
+// ******************************
+int add_to_queue(struct proc *p, int q_id)
+{	
+
+	for(int i=0; i < q_num[q_id]; i++)
+	{
+		if(p->pid == queue[q_id][i]->pid)
+			return -1;
+	}
+	p->enter_q_time = ticks;
+	p -> queue_id = q_id;
+	q_num[q_id]++;
+	queue[q_id][q_num[q_id]] = p;
+
+	return 1;
+}
+
+int remove_from_queue(struct proc *p, int q_id)
+{
+	int found_flag = 0;
+  int temp = 0;
+	for(int i=0; i <= q_num[q_id]; i++)
+	{
+		if(queue[q_id][i] -> pid == p->pid)
+		{
+			temp = i;
+			found_flag = 1;
+			break;
+		}
+	}
+
+	if(found_flag  == 0)
+	{
+		cprintf("Process %d not found in Queue %d\n", p->pid, q_id);
+		return -1;
+	}
+
+	for(int i = temp; i < q_num[q_id]; i++)
+		queue[q_id][i] = queue[q_id][i+1]; 
+
+	q_num[q_id] -= 1;
+	return 1;
+
+}
+
+void set_change_flag(struct proc *p) {
+  acquire(&ptable.lock);
+  p->change_flag = 1;
+  release(&ptable.lock);
+}
+
+void incr_run_time(struct proc *p){
+	acquire(&ptable.lock);
+	p->run_time++;
+	release(&ptable.lock);
+}
+
+// ******************************
+
+
+
 
 void
 pinit(void)
@@ -115,6 +183,10 @@ found:
   // 利用trap.c ticks时钟
   p->start_time = ticks;
   p->end_time = 0;
+
+  p->queue_id = 0;
+  p->run_time = 0;
+  p->enter_q_time = 0;
   return p;
 }
 
@@ -152,7 +224,7 @@ userinit(void)
   acquire(&ptable.lock);
 
   p->state = RUNNABLE;
-
+  add_to_queue(p, 0);
   release(&ptable.lock);
 }
 
@@ -218,6 +290,11 @@ fork(void)
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
+
+// ******
+// 默认加到最高优先级队列
+  add_to_queue(np, 0);      
+// ******
 
   release(&ptable.lock);
 
@@ -330,7 +407,6 @@ wait(void)
 void
 scheduler(void)
 {
-  struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
   
@@ -340,22 +416,59 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
+    // ******
+    // 防止进程饥饿，调整优先级
+    for(int i = 1; i < 5; i++) {
+      for(int j = 0; j <= q_num[i]; j++) {
+        struct proc *p = queue[i][j];
+        int age = ticks - p->enter_q_time;
+        if(age > 30) {
+          remove_from_queue(p, i);
+          add_to_queue(p, i);
+        }
+      }
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      c->proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->proc = 0;
-    } // for
+      struct  proc *p = 0;
+      // 所有队列中拿出第一个进程
+      for(int i = 0; i < 5; i++) {
+        // 队列存在进程
+        if(q_num[i] >= 0) {
+          p = queue[i][0];
+          remove_from_queue(p, i);
+          break;
+        }
+      }
+      
+
+      if(p != 0 && p->state == RUNNABLE) {
+        p->run_time++;
+        c->proc = p;
+        switchuvm(p);
+        p->state = RUNNING;
+
+        swtch(&(c->scheduler), p->context);
+        switchkvm();
+
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        c->proc = 0;
+
+        if(p != 0 && p->state == RUNNABLE) {
+          // 需要降低优先级
+          if (p->change_flag == 1) {
+            p->change_flag = 0;
+            p->run_time = 0;
+            if(p->queue_id != 4) {
+              p->queue_id++;
+            }
+          }
+          else {
+            p->run_time = 0;
+          }
+          add_to_queue(p, p->queue_id);
+        }
+      }
+    }
     release(&ptable.lock);
   }
 }
@@ -465,8 +578,10 @@ wakeup1(void *chan)
   struct proc *p;
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
+    if(p->state == SLEEPING && p->chan == chan) {
       p->state = RUNNABLE;
+      add_to_queue(p, p->queue_id);
+    }
 }
 
 // Wake up all processes sleeping on chan.
@@ -491,8 +606,10 @@ kill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       // Wake process from sleep if necessary.
-      if(p->state == SLEEPING)
+      if(p->state == SLEEPING){
         p->state = RUNNABLE;
+        add_to_queue(p, p->queue_id);
+      }
       release(&ptable.lock);
       return 0;
     }
